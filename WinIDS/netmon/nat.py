@@ -1,0 +1,2009 @@
+import sys
+import os
+import tkinter as tk
+from tkinter import ttk, messagebox, font, filedialog
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+import matplotlib.animation as animation
+import matplotlib.pyplot as plt
+from matplotlib import style
+import threading
+import queue
+import time
+import socket
+import ctypes
+from collections import deque
+import pandas as pd
+import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
+from .network_monitor import SystemNetworkMonitor
+import datetime
+import json
+import csv
+from matplotlib import cm
+from collections import defaultdict
+import psutil
+import ipaddress
+import logging
+from matplotlib.lines import Line2D
+
+# Make plotly optional for map functionality
+PLOTLY_AVAILABLE = False
+try:
+    import plotly
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    import plotly.io as pio
+    # Configure plotly to render for tkinter
+    pio.renderers.default = "browser"  # Open maps in browser for now
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    print("Plotly not available - map functionality will be limited.")
+    print("To install plotly: pip install plotly")
+
+style.use('ggplot')
+
+class NetworkAnalyzerGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("WinIDS Network Analyzer")
+        self.root.geometry("1280x800")
+        
+        # Define available themes
+        self.available_themes = {
+            "Dark": {
+                "bg": "#2E3440",
+                "fg": "#ECEFF4",
+                "accent": "#5E81AC",
+                "button": "#3B4252",
+                "alert": "#BF616A",
+                "success": "#A3BE8C",
+                "highlight": "#4C566A",
+                "chart_bg": "#3B4252"
+            },
+            "Light": {
+                "bg": "#ECEFF4", 
+                "fg": "#2E3440",
+                "accent": "#5E81AC",
+                "button": "#D8DEE9",
+                "alert": "#BF616A",
+                "success": "#A3BE8C",
+                "highlight": "#E5E9F0",
+                "chart_bg": "#E5E9F0"
+            },
+            "Grey": {
+                "bg": "#4C566A",
+                "fg": "#ECEFF4",
+                "accent": "#88C0D0",
+                "button": "#3B4252",
+                "alert": "#BF616A",
+                "success": "#A3BE8C",
+                "highlight": "#2E3440",
+                "chart_bg": "#3B4252"
+            }
+        }
+        
+        # Current theme - default to Dark
+        self.current_theme = "Dark"
+        self.theme_colors = self.available_themes[self.current_theme]
+        
+        # Set theme
+        self.style = ttk.Style()
+        try:
+            self.style.theme_use('clam')
+        except:
+            print("Could not set theme to 'clam', using default theme")
+        
+        # Custom colors
+        self.apply_theme("Light")  # Start with light theme instead of dark theme
+        
+        # Check if running as admin
+        self.is_admin = self.check_admin_privileges()
+        if not self.is_admin:
+            messagebox.showwarning("Admin Required", 
+                                 "Network Analyzer requires administrator privileges for full functionality.\nSome features may not work correctly.")
+        
+        # Create menu
+        self.create_menu()
+        
+        # Create control buttons at top of window for better visibility
+        self.control_frame = ttk.Frame(root)
+        self.control_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Add large, colorful buttons
+        self.start_button = ttk.Button(self.control_frame, text="START MONITORING", 
+                                     command=self.start_monitoring,
+                                     style="StartButton.TButton")
+        self.start_button.pack(side=tk.LEFT, padx=20, pady=5)
+        
+        self.stop_button = ttk.Button(self.control_frame, text="STOP MONITORING", 
+                                    command=self.stop_monitoring, 
+                                    state=tk.DISABLED,
+                                    style="StopButton.TButton")
+        self.stop_button.pack(side=tk.LEFT, padx=20, pady=5)
+        
+        self.export_button = ttk.Button(self.control_frame, text="EXPORT DATA", 
+                                      command=self.export_data)
+        self.export_button.pack(side=tk.LEFT, padx=20, pady=5)
+        
+        self.status_var = tk.StringVar(value="Status: Ready to Monitor")
+        self.status_label = ttk.Label(self.control_frame, textvariable=self.status_var, font=('Arial', 12))
+        self.status_label.pack(side=tk.RIGHT, padx=20, pady=5)
+        
+        # Create main frame
+        self.main_frame = ttk.Frame(root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create notebook (tabs)
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+        
+        # Create tabs
+        self.overview_tab = ttk.Frame(self.notebook)
+        self.connections_tab = ttk.Frame(self.notebook)
+        self.map_tab = ttk.Frame(self.notebook)  # New map tab for geolocation
+        self.ports_tab = ttk.Frame(self.notebook)
+        self.applications_tab = ttk.Frame(self.notebook)
+        self.settings_tab = ttk.Frame(self.notebook)  # New settings tab
+        
+        self.notebook.add(self.overview_tab, text="Overview")
+        self.notebook.add(self.connections_tab, text="Connections")
+        if PLOTLY_AVAILABLE:
+            self.notebook.add(self.map_tab, text="World Map")  # Add map tab to notebook
+        else:
+            self.notebook.add(self.map_tab, text="World Map (Limited)")  # Add map tab with plotly limitation noted
+        self.notebook.add(self.ports_tab, text="Ports")
+        self.notebook.add(self.applications_tab, text="Applications")
+        self.notebook.add(self.settings_tab, text="Settings")  # Add settings tab
+        
+        # Set up tabs
+        self.setup_overview_tab()
+        self.setup_connections_tab()
+        self.setup_map_tab()  # Set up the new map tab
+        self.setup_ports_tab()
+        self.setup_applications_tab()
+        self.setup_settings_tab()  # Set up the settings tab
+        
+        # Initialize data structures
+        self.time_data = deque(maxlen=60)
+        self.packets_data = deque(maxlen=60)
+        self.bytes_data = deque(maxlen=60)
+        self.protocol_data = {}
+        self.connection_data = []
+        self.port_data = []
+        self.application_data = []
+        self.domain_data = []
+        self.geo_data = {'connections': [], 'countries': {}}  # Store geolocation data
+        
+        # Initialize monitor
+        self.monitor = None
+        self.monitor_thread = None
+        self.queue = queue.Queue()
+        self.running = False
+        
+        # Map animation
+        self.map_animation = None
+        # Overview animation
+        self.overview_animation = None
+        
+        # Set up close event handler
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        
+        # Add a note about starting monitoring
+        note_frame = ttk.Frame(root)
+        note_frame.pack(fill=tk.X, padx=10, pady=5)
+        note_label = ttk.Label(note_frame, 
+                              text="Note: Click the 'START MONITORING' button above to begin capturing network traffic.", 
+                              font=('Arial', 10, 'italic'))
+        note_label.pack(pady=5)
+        
+    def on_close(self):
+        """Handle window close event"""
+        try:
+            # Stop monitoring if running
+            if self.running:
+                self.stop_monitoring()
+            
+            # Destroy the window
+            self.root.destroy()
+        except Exception as e:
+            print(f"Error during shutdown: {e}")
+            # Force destroy the window
+            self.root.destroy()
+    
+    def create_menu(self):
+        """Create the application menu"""
+        menubar = tk.Menu(self.root)
+        
+        # File menu
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Export Connections", command=lambda: self.export_data("connections"))
+        file_menu.add_command(label="Export Applications", command=lambda: self.export_data("applications"))
+        if PLOTLY_AVAILABLE:
+            file_menu.add_command(label="Export Geo Data", command=lambda: self.export_data("geo"))
+        else:
+            file_menu.add_command(label="Export Limited Geo Data", command=lambda: self.export_data("geo"))
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.on_close)
+        menubar.add_cascade(label="File", menu=file_menu)
+        
+        # View menu
+        view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu.add_command(label="Overview", command=lambda: self.notebook.select(0))
+        view_menu.add_command(label="Connections", command=lambda: self.notebook.select(1))
+        if PLOTLY_AVAILABLE:
+            view_menu.add_command(label="World Map", command=lambda: self.notebook.select(2))
+        else:
+            view_menu.add_command(label="World Map (Limited)", command=lambda: self.notebook.select(2))
+        view_menu.add_command(label="Ports", command=lambda: self.notebook.select(3))
+        view_menu.add_command(label="Applications", command=lambda: self.notebook.select(4))
+        menubar.add_cascade(label="View", menu=view_menu)
+        
+        # Tools menu
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(label="Traffic Recording", command=self.record_traffic)
+        tools_menu.add_command(label="Connection Blocking", command=self.block_connection)
+        tools_menu.add_separator()
+        tools_menu.add_command(label="Clear Statistics", command=self.clear_stats)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        
+        # Help menu
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="About", command=self.show_about)
+        menubar.add_cascade(label="Help", menu=help_menu)
+        
+        self.root.config(menu=menubar)
+    
+    def check_admin_privileges(self):
+        """Check if running with administrator privileges"""
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except:
+            return False
+    
+    def setup_overview_tab(self):
+        """
+        Set up the overview tab with basic statistics and graphs
+        """
+        # Create statistics frame
+        stats_frame = ttk.Frame(self.overview_tab)
+        stats_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Create graph frame
+        graph_frame = ttk.Frame(self.overview_tab)
+        graph_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create statistics display
+        self.total_packets_var = tk.StringVar(value="Total Packets: 0")
+        self.total_traffic_var = tk.StringVar(value="Total Traffic: 0 MB")
+        self.packet_rate_var = tk.StringVar(value="Packet Rate: 0 pps")
+        self.bandwidth_var = tk.StringVar(value="Bandwidth: 0 Mbps")
+        
+        # Create labels with larger, more readable font
+        font_style = ('Arial', 11)
+        
+        packet_label = ttk.Label(stats_frame, textvariable=self.total_packets_var, font=font_style)
+        packet_label.pack(side=tk.LEFT, padx=10)
+        
+        traffic_label = ttk.Label(stats_frame, textvariable=self.total_traffic_var, font=font_style)
+        traffic_label.pack(side=tk.LEFT, padx=10)
+        
+        rate_label = ttk.Label(stats_frame, textvariable=self.packet_rate_var, font=font_style)
+        rate_label.pack(side=tk.LEFT, padx=10)
+        
+        bandwidth_label = ttk.Label(stats_frame, textvariable=self.bandwidth_var, font=font_style)
+        bandwidth_label.pack(side=tk.LEFT, padx=10)
+        
+        # Create top and bottom frames for graphs
+        top_graph_frame = ttk.Frame(graph_frame)
+        top_graph_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        bottom_graph_frame = ttk.Frame(graph_frame)
+        bottom_graph_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        # Create traffic graph (combines packet rate and bandwidth)
+        traffic_fig = Figure(figsize=(6, 3), dpi=100)
+        self.traffic_ax = traffic_fig.add_subplot(111)
+        self.traffic_canvas = FigureCanvasTkAgg(traffic_fig, top_graph_frame)
+        self.traffic_canvas.draw()
+        self.traffic_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        
+        # Create protocol distribution graph
+        protocol_fig = Figure(figsize=(5, 3), dpi=100)
+        self.protocol_ax = protocol_fig.add_subplot(111)
+        self.protocol_canvas = FigureCanvasTkAgg(protocol_fig, bottom_graph_frame)
+        self.protocol_canvas.draw()
+        self.protocol_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        
+        # Initialize time series data
+        self.time_data = []
+        self.packets_data = []
+        self.bytes_data = []
+        self.protocol_data = {}
+        
+        # Apply styling to the graphs
+        traffic_fig.set_facecolor(self.theme_colors["chart_bg"])
+        self.traffic_ax.set_facecolor(self.theme_colors["chart_bg"])
+        protocol_fig.set_facecolor(self.theme_colors["chart_bg"])
+        self.protocol_ax.set_facecolor(self.theme_colors["chart_bg"])
+    
+    def setup_connections_tab(self):
+        # Create and configure connections treeview
+        columns = ("Source", "Destination", "Protocol", "Traffic", "Application", "Duration", "Location")
+        self.conn_tree = ttk.Treeview(self.connections_tab, columns=columns, show='headings')
+        
+        # Define column headings
+        for col in columns:
+            self.conn_tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(self.conn_tree, c, False))
+            self.conn_tree.column(col, width=100)
+        
+        # Set column widths
+        self.conn_tree.column("Source", width=150)
+        self.conn_tree.column("Destination", width=150)
+        self.conn_tree.column("Protocol", width=80)
+        self.conn_tree.column("Traffic", width=80)
+        self.conn_tree.column("Application", width=120)
+        self.conn_tree.column("Duration", width=80)
+        self.conn_tree.column("Location", width=150)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(self.connections_tab, orient=tk.VERTICAL, command=self.conn_tree.yview)
+        self.conn_tree.configure(yscroll=scrollbar.set)
+        
+        # Pack widgets
+        self.conn_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    def setup_map_tab(self):
+        """Set up the map tab with world map display"""
+        # Create map frame
+        map_frame = ttk.Frame(self.map_tab)
+        map_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        if PLOTLY_AVAILABLE:
+            # Create container frame for map controls and info
+            control_frame = ttk.Frame(map_frame)
+            control_frame.pack(fill=tk.X, side=tk.TOP, padx=10, pady=10)
+            
+            # Add button to open the map in a browser
+            self.view_map_btn = ttk.Button(control_frame, text="View World Map in Browser", 
+                                         command=self.open_world_map_browser)
+            self.view_map_btn.pack(side=tk.LEFT, padx=5, pady=5)
+            
+            # Add info label
+            info_label = ttk.Label(control_frame, text="Map data is collected in real-time. Click the button to view the current map.")
+            info_label.pack(side=tk.LEFT, padx=20)
+            
+            # Create stats frame for displaying connection statistics
+            stats_frame = ttk.Frame(map_frame)
+            stats_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            # Create a treeview to display country statistics
+            columns = ("Country", "Connections", "Traffic")
+            self.geo_tree = ttk.Treeview(stats_frame, columns=columns, show='headings', height=10)
+            
+            # Configure columns
+            for col in columns:
+                self.geo_tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(self.geo_tree, c, False))
+                
+            self.geo_tree.column("Country", width=150)
+            self.geo_tree.column("Connections", width=100)
+            self.geo_tree.column("Traffic", width=100)
+        
+            # Add scrollbar
+            scrollbar = ttk.Scrollbar(stats_frame, orient=tk.VERTICAL, command=self.geo_tree.yview)
+            self.geo_tree.configure(yscroll=scrollbar.set)
+        
+            # Pack widgets
+            self.geo_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            # Initialize an empty map figure
+            self.map_fig = None
+            
+            # Create info frame at the bottom
+            info_frame = ttk.Frame(map_frame)
+            info_frame.pack(fill=tk.X, side=tk.BOTTOM, padx=10, pady=5)
+            
+            # Add a note about the map functionality
+            note_label = ttk.Label(info_frame, 
+                                  text="Note: Geographic visualization is powered by Plotly and will open in your web browser.",
+                                  font=('Arial', 9, 'italic'))
+            note_label.pack(pady=5)
+            
+        else:
+            # Create a simple message when plotly is not available
+            msg_frame = ttk.Frame(map_frame)
+            msg_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            msg_label = ttk.Label(msg_frame,
+                                text="Map functionality requires the Plotly package.\n\nPlease install plotly to enable world map visualization.",
+                                font=('Arial', 12),
+                                justify=tk.CENTER)
+            msg_label.pack(expand=True, fill=tk.BOTH)
+            
+            # Create instruction label
+            install_label = ttk.Label(map_frame,
+                                    text="To install Plotly: Run 'pip install plotly'",
+                                    font=('Arial', 10))
+            install_label.pack(pady=5)
+
+    def open_world_map_browser(self):
+        """Generate and open the world map in a browser"""
+        if not PLOTLY_AVAILABLE:
+            messagebox.showinfo("Plotly Required", "Plotly is not installed. Please install it to use the map feature.")
+            return
+            
+        try:
+            # Check if we have geo data
+            if not hasattr(self, 'geo_data') or not self.geo_data.get('connections'):
+                messagebox.showinfo("No Data", "No connection data available yet. Start monitoring to collect geographic data.")
+                return
+                
+            connections = self.geo_data.get('connections', [])
+            
+            # Create a new plotly figure
+            fig = go.Figure()
+            
+            # Add a base layer with a world map
+            fig.add_trace(go.Scattergeo(
+                locationmode='ISO-3',
+                lon = [],
+                lat = [],
+                mode = 'markers',
+                marker = dict(size=1, color='blue'),
+                showlegend=False,
+                name="Base"
+            ))
+            
+            # Process connection data
+            connection_groups = defaultdict(list)
+            for conn in connections:
+                # Skip connections without coordinates
+                if ('latitude' not in conn or 'longitude' not in conn or
+                    conn['latitude'] == 0 or conn['longitude'] == 0):
+                    continue
+                
+                # Create a key for the source-destination pair
+                key = f"{conn['src_ip']}-{conn['dst_ip']}"
+                connection_groups[key].append(conn)
+                
+            # Fixed starting point (approximately center of US)
+            start_lon, start_lat = -97.0, 38.0
+            
+            # Add connections as lines
+            for key, conns in connection_groups.items():
+                if not conns:
+                    continue
+                
+                # Get a representative connection
+                conn = conns[0]
+                
+                # Calculate total bytes for this connection group
+                total_bytes = sum(c.get('bytes', 0) for c in conns)
+                
+        # Normalize for color and width
+                if total_bytes > 0:
+                    intensity = np.log10(total_bytes) / 8  # Assuming max ~100MB
+                    intensity = max(0.1, min(intensity, 1.0))  # Clamp between 0.1 and 1.0
+                else:
+                    intensity = 0.1
+                
+                end_lon, end_lat = conn['longitude'], conn['latitude']
+                
+                # Skip if coordinates are invalid
+                if not all([start_lon, start_lat, end_lon, end_lat]):
+                    continue
+                
+                # Add a great circle connection line
+                fig.add_trace(
+                    go.Scattergeo(
+                        locationmode = 'ISO-3',
+                        lon = [start_lon, end_lon],
+                        lat = [start_lat, end_lat],
+                        mode = 'lines',
+                        line = dict(
+                            width = 1 + intensity * 3,
+                            color = f'rgba(255, {int(255*(1-intensity))}, 0, 0.8)'
+                        ),
+                        opacity = 0.7,
+                        name = f"{conn.get('dst_country', 'Unknown')}: {self.format_bytes(total_bytes)}"
+                    )
+                )
+                
+                # Add destination marker with hover info
+                fig.add_trace(
+                    go.Scattergeo(
+                        locationmode = 'ISO-3',
+                        lon = [end_lon],
+                        lat = [end_lat],
+                        text = f"Country: {conn.get('dst_country', 'Unknown')}<br>" +
+                               f"City: {conn.get('dst_city', 'Unknown')}<br>" +
+                               f"IP: {conn.get('dst_ip', 'Unknown')}<br>" +
+                               f"Traffic: {self.format_bytes(total_bytes)}",
+                        mode = 'markers',
+                        marker = dict(
+                            size = 5 + intensity * 10,
+                            color = 'red',
+                            line = dict(width=1, color='black')
+                        ),
+                        name = conn.get('dst_country', 'Unknown')
+                    )
+                )
+            
+            # Update the layout
+            fig.update_layout(
+                title = 'Global Network Connections',
+                geo = dict(
+                    projection_type = 'natural earth',
+                    showland = True,
+                    landcolor = 'rgb(217, 217, 217)',
+                    showocean = True,
+                    oceancolor = 'rgb(158, 202, 225)',
+                    showlakes = True,
+                    lakecolor = 'rgb(158, 202, 225)',
+                    showcountries = True,
+                    countrycolor = 'rgb(80, 80, 80)',
+                    showcoastlines = True,
+                    coastlinecolor = 'rgb(80, 80, 80)',
+                    resolution = 50
+                ),
+                height = 700,
+                margin = dict(l=0, r=0, t=50, b=10)
+            )
+            
+            # Save and open the map
+            temp_file = os.path.join(os.path.expanduser('~'), 'winids_map.html')
+            fig.write_html(temp_file, auto_open=True)
+            
+        except Exception as e:
+            messagebox.showerror("Map Error", f"Error creating map: {str(e)}")
+            print(f"Error creating world map: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def update_map(self, frame=None):
+        """Update the map data and country statistics table"""
+        if not PLOTLY_AVAILABLE:
+            return
+            
+        try:
+            # Get the latest geo data
+            if not hasattr(self, 'geo_data'):
+                self.geo_data = {'connections': [], 'countries': {}}
+                
+            # Update country statistics in the treeview
+            if hasattr(self, 'geo_tree'):
+                # Clear existing data
+                for item in self.geo_tree.get_children():
+                    self.geo_tree.delete(item)
+                
+                # Get country statistics
+                countries_data = []
+                country_bytes = defaultdict(int)
+                country_conns = defaultdict(int)
+                
+                # Process connections to calculate traffic per country
+                for conn in self.geo_data.get('connections', []):
+                    country = conn.get('dst_country', 'Unknown')
+                    country_bytes[country] += conn.get('bytes', 0)
+                    country_conns[country] += 1
+                
+                # Format for display
+                for country, bytes_count in country_bytes.items():
+                    countries_data.append((
+                        country,
+                        country_conns[country],
+                        self.format_bytes(bytes_count)
+                    ))
+                
+                # Sort by traffic
+                countries_data.sort(key=lambda x: country_bytes[x[0]], reverse=True)
+                
+                # Add to treeview
+                for country, conns, traffic in countries_data:
+                    self.geo_tree.insert('', tk.END, values=(country, conns, traffic))
+                
+                # If no data, add a placeholder
+                if not countries_data:
+                    self.geo_tree.insert('', tk.END, values=("No geographic data", "-", "-"))
+        
+        except Exception as e:
+            print(f"Error updating map data: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def format_bytes(self, bytes_count):
+        """Format bytes to human-readable string"""
+        if bytes_count < 1024:
+            return f"{bytes_count} B"
+        elif bytes_count < 1024 * 1024:
+            return f"{bytes_count/1024:.1f} KB"
+        elif bytes_count < 1024 * 1024 * 1024:
+            return f"{bytes_count/1024/1024:.2f} MB"
+        else:
+            return f"{bytes_count/1024/1024/1024:.2f} GB"
+    
+    def export_data(self, data_type=None):
+        """
+        Export collected data to CSV files
+        If data_type is not specified, ask user what to export
+        """
+        try:
+            # Check if we have any data to export
+            if not self.running and not hasattr(self, 'current_data'):
+                messagebox.showwarning("No Data", "No network data available to export.\nPlease start monitoring first.")
+                return
+            
+            # If no data type specified, ask user what to export
+            if data_type is None:
+                from tkinter import simpledialog
+                data_types = ["connections", "applications", "ports", "geo"]
+                data_type = simpledialog.askstring(
+                    "Export Type",
+                    "What data would you like to export?\n(connections, applications, ports, geo)",
+                    initialvalue="connections"
+                )
+                if not data_type or data_type.lower() not in data_types:
+                    return
+                data_type = data_type.lower()
+            
+            # Get file name for saving
+            from tkinter import filedialog
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                title=f"Export {data_type.capitalize()} Data"
+            )
+            
+            if not filename:  # User cancelled
+                return
+            
+            # Get data based on type
+            if data_type == "connections":
+                if not hasattr(self, 'current_data') or 'sessions' not in self.current_data:
+                    messagebox.showwarning("No Data", "No connection data available to export.")
+                    return
+                
+                # Export connection data
+                sessions = self.current_data.get('sessions', {})
+                rows = []
+                
+                # Create header row
+                headers = ["Source IP", "Source Port", "Destination IP", "Destination Port", 
+                          "Protocol", "Bytes", "Packets", "Process", "Duration", "Country", "City"]
+                rows.append(headers)
+                
+                # Add data rows
+                for session_key, session in sessions.items():
+                    source_ip = session.get('src_ip', 'Unknown')
+                    source_port = session.get('src_port', 0)
+                    dest_ip = session.get('dst_ip', 'Unknown')
+                    dest_port = session.get('dst_port', 0)
+                    protocol = session.get('protocol', 'Unknown')
+                    bytes_count = session.get('bytes', 0)
+                    packets = session.get('packets', 0)
+                    process = session.get('process', 'Unknown')
+                    
+                    # Calculate duration
+                    start_time = session.get('start_time', time.time())
+                    last_time = session.get('last_time', time.time())
+                    duration = last_time - start_time
+                    
+                    # Get location if available
+                    country = session.get('dst_country', 'Unknown')
+                    city = session.get('dst_city', 'Unknown')
+                    
+                    row = [source_ip, source_port, dest_ip, dest_port, protocol, 
+                          bytes_count, packets, process, f"{duration:.1f}", country, city]
+                    rows.append(row)
+            
+            elif data_type == "applications":
+                if not hasattr(self, 'current_data') or 'applications' not in self.current_data:
+                    messagebox.showwarning("No Data", "No application data available to export.")
+                    return
+                
+                # Export application data
+                applications = self.current_data.get('applications', {})
+                rows = []
+                
+                # Create header row
+                headers = ["Application", "Bytes", "Connections", "Domains"]
+                rows.append(headers)
+                
+                # Add data rows
+                for app, data in applications.items():
+                    if isinstance(data, dict):
+                        bytes_total = data.get('bytes', 0)
+                        connections = len(data.get('connections', set()))
+                        domains = "; ".join(sorted(list(data.get('domains', set()))))
+                    else:
+                        bytes_total = 0
+                        connections = data if isinstance(data, (int, float)) else 0
+                        domains = ""
+                    
+                    row = [app, bytes_total, connections, domains]
+                    rows.append(row)
+            
+            elif data_type == "ports":
+                if not hasattr(self, 'current_data') or 'ports' not in self.current_data:
+                    messagebox.showwarning("No Data", "No port data available to export.")
+                    return
+                
+                # Export port data
+                ports = self.current_data.get('ports', {})
+                rows = []
+                
+                # Create header row
+                headers = ["Port", "Service", "Packets", "Applications"]
+                rows.append(headers)
+                
+                # Get well-known services mapping (simplified version)
+                port_services = {
+                    '20': 'FTP Data', '21': 'FTP Control', '22': 'SSH', '23': 'Telnet',
+                    '25': 'SMTP', '53': 'DNS', '80': 'HTTP', '443': 'HTTPS',
+                    '110': 'POP3', '143': 'IMAP', '443': 'HTTPS', '3389': 'RDP'
+                }
+                
+                # Get applications using ports
+                port_apps = {}
+                if 'sessions' in self.current_data:
+                    sessions = self.current_data.get('sessions', {})
+                    for session_key, session_data in sessions.items():
+                        src_port = str(session_data.get('src_port', 0))
+                        dst_port = str(session_data.get('dst_port', 0))
+                        process = session_data.get('process', 'Unknown')
+                        
+                        if process != 'Unknown':
+                            if src_port and src_port != '0':
+                                if src_port not in port_apps:
+                                    port_apps[src_port] = set()
+                                port_apps[src_port].add(process)
+                            
+                            if dst_port and dst_port != '0':
+                                if dst_port not in port_apps:
+                                    port_apps[dst_port] = set()
+                                port_apps[dst_port].add(process)
+                
+                # Add data rows
+                for port, count in ports.items():
+                    if not isinstance(count, (int, float)) or count <= 0:
+                        continue
+                    
+                    port_str = str(port)
+                    service = port_services.get(port_str, 'Unknown')
+                    applications = "; ".join(port_apps.get(port_str, []))
+                    
+                    row = [port_str, service, count, applications]
+                    rows.append(row)
+            
+            elif data_type == "geo":
+                if not hasattr(self, 'geo_data') or not self.geo_data.get('connections'):
+                    messagebox.showwarning("No Data", "No geographic data available to export.")
+                    return
+                
+                # Export geo data
+                connections = self.geo_data.get('connections', [])
+                rows = []
+                
+                # Create header row
+                headers = ["Source IP", "Destination IP", "Country", "City", "Latitude", "Longitude", "Bytes"]
+                rows.append(headers)
+                
+                # Add data rows
+                for conn in connections:
+                    source_ip = conn.get('src_ip', 'Unknown')
+                    dest_ip = conn.get('dst_ip', 'Unknown')
+                    country = conn.get('dst_country', 'Unknown')
+                    city = conn.get('dst_city', 'Unknown')
+                    latitude = conn.get('latitude', 0)
+                    longitude = conn.get('longitude', 0)
+                    bytes_count = conn.get('bytes', 0)
+                    
+                    row = [source_ip, dest_ip, country, city, latitude, longitude, bytes_count]
+                    rows.append(row)
+            
+            # Write data to CSV file
+            import csv
+            with open(filename, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerows(rows)
+            
+            # Show success message
+            messagebox.showinfo("Export Complete", 
+                             f"Successfully exported {len(rows)-1} {data_type} to:\n{filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export data: {str(e)}")
+            print(f"Error exporting data: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def update_connections_table(self, connections, sessions):
+        """Update the connections table"""
+        try:
+            # Only update the table if the connections tab is currently visible
+            current_tab = self.notebook.select()
+            tab_name = self.notebook.tab(current_tab, "text")
+            
+            if tab_name != "Connections":
+                # Skip updating the table if it's not visible
+                return
+                
+            # Clear table
+            for item in self.conn_tree.get_children():
+                self.conn_tree.delete(item)
+            
+            # Add connections from sessions
+            if not sessions or len(sessions) == 0:
+                # Display placeholder if no data
+                self.conn_tree.insert('', tk.END, values=("No active connections detected", "", "", "", "", "", ""))
+                return
+                
+            # Sort sessions by bytes (most active first)
+            sorted_sessions = sorted(sessions.items(), key=lambda x: x[1]['bytes'], reverse=True)
+            
+            # Add the active sessions to the table
+            for session_key, session_data in sorted_sessions:
+                try:
+                    # Format source and destination
+                    src = f"{session_data['src_ip']}:{session_data['src_port']}"
+                    dst = f"{session_data['dst_ip']}:{session_data['dst_port']}"
+                    
+                    # Format protocol
+                    protocol = session_data['protocol']
+                    
+                    # Format bytes
+                    bytes_str = f"{session_data['bytes']/1024:.2f} KB"
+                    
+                    # Format process
+                    process = session_data.get('process', 'Unknown')
+                    if process == 'Unknown' and session_data.get('pid', 0) > 0:
+                        try:
+                            process = psutil.Process(session_data['pid']).name()
+                        except:
+                            pass
+                    
+                    # Calculate duration
+                    start_time = session_data.get('start_time', time.time())
+                    last_time = session_data.get('last_time', time.time())
+                    duration = last_time - start_time
+                    duration_str = f"{duration:.1f}s"
+                    
+                    # Get location
+                    location = session_data.get('location', 'Unknown')
+                    
+                    # Insert into tree
+                    self.conn_tree.insert('', tk.END, values=(src, dst, protocol, bytes_str, process, duration_str, location))
+                except Exception as e:
+                    print(f"Error adding session to table: {e}")
+        except Exception as e:
+            print(f"Error updating connections table: {e}")
+    
+    def update_ports_table(self, ports):
+        """Update the ports table with the latest data"""
+        try:
+            # Only update if Ports tab is visible
+            current_tab = self.notebook.select()
+            tab_name = self.notebook.tab(current_tab, "text")
+            if tab_name != "Ports":
+                return
+                
+            # Debug print
+            print(f"Updating ports table with {len(ports)} ports")
+            
+            # Clear the current table
+            for row in self.ports_tree.get_children():
+                self.ports_tree.delete(row)
+            
+            # Check if we have port data
+            if not ports:
+                self.ports_tree.insert("", "end", values=("No port activity detected", "", "", ""))
+                return
+            
+            # Get well-known services for ports
+            port_services = {
+                # Common TCP ports
+                '20': 'FTP Data',
+                '21': 'FTP Control',
+                '22': 'SSH',
+                '23': 'Telnet',
+                '25': 'SMTP',
+                '53': 'DNS',
+                '80': 'HTTP',
+                '110': 'POP3',
+                '115': 'SFTP',
+                '119': 'NNTP',
+                '123': 'NTP',
+                '143': 'IMAP',
+                '161': 'SNMP',
+                '194': 'IRC',
+                '443': 'HTTPS',
+                '445': 'SMB',
+                '465': 'SMTPS',
+                '587': 'SMTP Submission',
+                '993': 'IMAPS',
+                '995': 'POP3S',
+                '1080': 'SOCKS',
+                '1194': 'OpenVPN',
+                '1433': 'MSSQL',
+                '1723': 'PPTP',
+                '3306': 'MySQL',
+                '3389': 'RDP',
+                '5060': 'SIP',
+                '5222': 'XMPP',
+                '5432': 'PostgreSQL',
+                '5900': 'VNC',
+                '6667': 'IRC',
+                '8080': 'HTTP Proxy',
+                '8443': 'HTTPS Alt',
+                '9090': 'WebSocket',
+                '9091': 'Transmission',
+                '9418': 'Git',
+                
+                # Common UDP ports
+                '53': 'DNS',
+                '67': 'DHCP Server',
+                '68': 'DHCP Client',
+                '69': 'TFTP',
+                '123': 'NTP',
+                '161': 'SNMP',
+                '500': 'IPsec',
+                '514': 'Syslog',
+                '520': 'RIP',
+                '1194': 'OpenVPN',
+                '1900': 'SSDP',
+                '4500': 'IPsec NAT',
+                '5060': 'SIP',
+                '5353': 'mDNS',
+                '51820': 'WireGuard'
+            }
+            
+            # Find applications using each port from sessions
+            # Need to access the session data
+            port_apps = {}
+            if hasattr(self, 'current_data') and 'sessions' in self.current_data:
+                sessions = self.current_data.get('sessions', {})
+                for session_key, session_data in sessions.items():
+                    src_port = str(session_data.get('src_port', 0))
+                    dst_port = str(session_data.get('dst_port', 0))
+                    process = session_data.get('process', 'Unknown')
+                    
+                    # Add process to port's applications list
+                    if process != 'Unknown':
+                        if src_port and src_port != '0':
+                            if src_port not in port_apps:
+                                port_apps[src_port] = set()
+                            port_apps[src_port].add(process)
+                        
+                        if dst_port and dst_port != '0':
+                            if dst_port not in port_apps:
+                                port_apps[dst_port] = set()
+                            port_apps[dst_port].add(process)
+            
+            # Process port data for display
+            sorted_ports = []
+            for port, count in ports.items():
+                # Skip ports with no activity
+                if not isinstance(count, (int, float)) or count <= 0:
+                    continue
+                
+                # Convert port to string for display and lookup
+                port_str = str(port)
+                
+                # Get service name
+                service = port_services.get(port_str, 'Unknown')
+                
+                # Get applications using this port
+                applications = port_apps.get(port_str, set())
+                applications_str = ", ".join(sorted(list(applications)[:3]))
+                if len(applications) > 3:
+                    applications_str += f"... ({len(applications) - 3} more)"
+                if not applications_str:
+                    applications_str = "Unknown"
+                
+                # Add to sorted list
+                sorted_ports.append((port_str, count, service, applications_str))
+            
+            # Sort by packet count (highest first)
+            sorted_ports.sort(key=lambda x: x[1], reverse=True)
+            
+            # Take top 30 ports for display
+            top_ports = sorted_ports[:30]
+            
+            # Add to the table
+            for i, (port, count, service, applications) in enumerate(top_ports):
+                self.ports_tree.insert(
+                    "", 
+                    "end", 
+                    text=str(i+1), 
+                    values=(port, service, count, applications)
+                )
+        
+        except Exception as e:
+            print(f"Error updating ports table: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def update_applications_table(self, applications, domains=None):
+        """Update the applications table with the latest data"""
+        try:
+            # Only update if Applications tab is visible
+            current_tab = self.notebook.select()
+            tab_name = self.notebook.tab(current_tab, "text")
+            if tab_name != "Applications":
+                return
+            
+            # Debug print
+            print(f"Updating applications table with {len(applications)} applications")
+            
+            # Clear the current table
+            for row in self.apps_tree.get_children():
+                self.apps_tree.delete(row)
+            
+            # Also clear the domains table
+            for row in self.domain_tree.get_children():
+                self.domain_tree.delete(row)
+                
+            # Check if we have applications data
+            if not applications:
+                self.apps_tree.insert("", "end", values=("No applications detected", "", "", ""))
+                return
+                
+            # Create a sorted list of applications by traffic
+            sorted_apps = []
+            
+            # Handle different data structures for applications
+            for app, data in applications.items():
+                # Handle dictionary or int data
+                if isinstance(data, dict):
+                    # New format - data is a dictionary with detailed information
+                    bytes_total = data.get('bytes', 0)
+                    connections = len(data.get('connections', set()))
+                    domains_set = data.get('domains', set())
+                    domains_str = ", ".join(sorted(list(domains_set)[:5]))  # Show first 5 domains
+                    if len(domains_set) > 5:
+                        domains_str += f"... ({len(domains_set) - 5} more)"
+                    
+                    # Format for display
+                    bytes_str = self.format_bytes(bytes_total)
+                elif isinstance(data, (int, float)):
+                    # Old format - data is just a count
+                    connections = data
+                    bytes_str = "Unknown"
+                    domains_str = ""
+                else:
+                    # Skip invalid entries
+                    continue
+                
+                # Add app to sorted list
+                sorted_apps.append((app, bytes_str, connections, domains_str))
+            
+            # Sort by connections count (highest first)
+            sorted_apps.sort(key=lambda x: x[2], reverse=True)
+            
+            # Take top 20 for display
+            top_apps = sorted_apps[:20]
+            
+            # Add to the table
+            for i, (app, bytes_str, connections, domains_str) in enumerate(top_apps):
+                self.apps_tree.insert(
+                    "", 
+                    "end", 
+                    text=str(i+1), 
+                    values=(app, bytes_str, connections, domains_str)
+                )
+            
+            # Update domains table if we have domain data
+            if domains:
+                sorted_domains = []
+                for domain, count in domains.items():
+                    if count > 0:
+                        # Find which applications use this domain
+                        apps_using = []
+                        for app, data in applications.items():
+                            if isinstance(data, dict) and domain in data.get('domains', set()):
+                                apps_using.append(app)
+                        
+                        apps_str = ", ".join(apps_using[:3])
+                        if len(apps_using) > 3:
+                            apps_str += f"... ({len(apps_using) - 3} more)"
+                            
+                        sorted_domains.append((domain, count, apps_str))
+                
+                # Sort domains by hit count
+                sorted_domains.sort(key=lambda x: x[1], reverse=True)
+                
+                # Take top 30 domains
+                top_domains = sorted_domains[:30]
+                
+                # Add to the domains table
+                for i, (domain, hits, apps) in enumerate(top_domains):
+                    self.domain_tree.insert(
+                        "", 
+                        "end", 
+                        text=str(i+1), 
+                        values=(domain, hits, apps)
+                    )
+                
+        except Exception as e:
+            print(f"Error updating applications table: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def setup_applications_tab(self):
+        """Set up the applications tab with running applications and domain statistics"""
+        # Create paned window for split display
+        paned_window = ttk.PanedWindow(self.applications_tab, orient=tk.VERTICAL)
+        paned_window.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create top frame for applications list
+        top_frame = ttk.Frame(paned_window)
+        top_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Applications label
+        apps_label = ttk.Label(top_frame, text="Network Applications", font=('Arial', 10, 'bold'))
+        apps_label.pack(anchor=tk.W, padx=5, pady=5)
+        
+        # Create treeview for applications
+        columns = ("Application", "Traffic", "Connections", "Domains")
+        self.apps_tree = ttk.Treeview(top_frame, columns=columns, show='headings')
+        
+        # Configure columns
+        for col in columns:
+            self.apps_tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(self.apps_tree, c, False))
+        
+        # Set column widths
+        self.apps_tree.column("Application", width=200)
+        self.apps_tree.column("Traffic", width=100)
+        self.apps_tree.column("Connections", width=100)
+        self.apps_tree.column("Domains", width=300)
+        
+        # Add scrollbar
+        apps_scrollbar = ttk.Scrollbar(top_frame, orient=tk.VERTICAL, command=self.apps_tree.yview)
+        self.apps_tree.configure(yscroll=apps_scrollbar.set)
+        
+        # Pack widgets for top frame
+        self.apps_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        apps_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Add top frame to paned window
+        paned_window.add(top_frame, weight=1)
+        
+        # Create bottom frame for domains
+        bottom_frame = ttk.Frame(paned_window)
+        bottom_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Domains label
+        domains_label = ttk.Label(bottom_frame, text="Domains Accessed", font=('Arial', 10, 'bold'))
+        domains_label.pack(anchor=tk.W, padx=5, pady=5)
+        
+        # Create treeview for domains
+        domain_columns = ("Domain", "Hits", "Applications")
+        self.domain_tree = ttk.Treeview(bottom_frame, columns=domain_columns, show='headings')
+        
+        # Configure columns
+        for col in domain_columns:
+            self.domain_tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(self.domain_tree, c, False))
+        
+        # Set column widths
+        self.domain_tree.column("Domain", width=300)
+        self.domain_tree.column("Hits", width=80)
+        self.domain_tree.column("Applications", width=300)
+        
+        # Add scrollbar
+        domain_scrollbar = ttk.Scrollbar(bottom_frame, orient=tk.VERTICAL, command=self.domain_tree.yview)
+        self.domain_tree.configure(yscroll=domain_scrollbar.set)
+        
+        # Pack widgets for bottom frame
+        self.domain_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        domain_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Add bottom frame to paned window
+        paned_window.add(bottom_frame, weight=1)
+
+    def setup_settings_tab(self):
+        """Set up the settings tab with configuration options"""
+        # Create master frame
+        settings_frame = ttk.Frame(self.settings_tab)
+        settings_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Add title
+        title_label = ttk.Label(settings_frame, text="Settings", font=('Arial', 12, 'bold'))
+        title_label.grid(row=0, column=0, sticky=tk.W, pady=(0, 15))
+        
+        # Theme settings section
+        theme_frame = ttk.LabelFrame(settings_frame, text="Appearance")
+        theme_frame.grid(row=1, column=0, sticky=tk.EW, pady=(0, 15), padx=5)
+        
+        theme_label = ttk.Label(theme_frame, text="Theme:")
+        theme_label.grid(row=0, column=0, padx=10, pady=10, sticky=tk.W)
+        
+        self.theme_var = tk.StringVar(value="system")
+        theme_options = ["system", "light", "dark"]
+        theme_dropdown = ttk.Combobox(theme_frame, textvariable=self.theme_var, values=theme_options)
+        theme_dropdown.grid(row=0, column=1, padx=10, pady=10, sticky=tk.W)
+        
+        # Monitoring settings section
+        monitor_frame = ttk.LabelFrame(settings_frame, text="Monitoring Settings")
+        monitor_frame.grid(row=2, column=0, sticky=tk.EW, pady=(0, 15), padx=5)
+        
+        # Auto-start option
+        self.autostart_var = tk.BooleanVar(value=False)
+        autostart_check = ttk.Checkbutton(
+            monitor_frame, 
+            text="Start monitoring automatically on application launch", 
+            variable=self.autostart_var
+        )
+        autostart_check.grid(row=0, column=0, columnspan=2, padx=10, pady=5, sticky=tk.W)
+        
+        # DNS Resolution option
+        self.dns_resolve_var = tk.BooleanVar(value=True)
+        dns_check = ttk.Checkbutton(
+            monitor_frame,
+            text="Enable DNS Resolution (more informative but slower)",
+            variable=self.dns_resolve_var
+        )
+        dns_check.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky=tk.W)
+        
+        # Geolocation option
+        self.geo_var = tk.BooleanVar(value=False)
+        geo_check = ttk.Checkbutton(
+            monitor_frame,
+            text="Enable IP Geolocation (requires internet connection)",
+            variable=self.geo_var
+        )
+        geo_check.grid(row=2, column=0, columnspan=2, padx=10, pady=5, sticky=tk.W)
+        
+        # Update interval
+        interval_label = ttk.Label(monitor_frame, text="Update interval (seconds):")
+        interval_label.grid(row=3, column=0, padx=10, pady=10, sticky=tk.W)
+        
+        self.interval_var = tk.StringVar(value="3")
+        interval_spinbox = ttk.Spinbox(
+            monitor_frame, 
+            from_=1, 
+            to=30, 
+            textvariable=self.interval_var,
+            width=5
+        )
+        interval_spinbox.grid(row=3, column=1, padx=10, pady=10, sticky=tk.W)
+        
+        # Advanced options section
+        advanced_frame = ttk.LabelFrame(settings_frame, text="Advanced Options")
+        advanced_frame.grid(row=3, column=0, sticky=tk.EW, pady=(0, 15), padx=5)
+        
+        # IP Filtering option
+        self.filter_local_var = tk.BooleanVar(value=True)
+        filter_check = ttk.Checkbutton(
+            advanced_frame,
+            text="Filter local network traffic (show only external connections)",
+            variable=self.filter_local_var
+        )
+        filter_check.grid(row=0, column=0, columnspan=2, padx=10, pady=5, sticky=tk.W)
+        
+        # Debug mode option
+        self.debug_var = tk.BooleanVar(value=False)
+        debug_check = ttk.Checkbutton(
+            advanced_frame,
+            text="Enable debug mode (verbose console output)",
+            variable=self.debug_var
+        )
+        debug_check.grid(row=1, column=0, columnspan=2, padx=10, pady=5, sticky=tk.W)
+        
+        # Buttons frame
+        button_frame = ttk.Frame(settings_frame)
+        button_frame.grid(row=4, column=0, sticky=tk.EW, pady=15, padx=5)
+        
+        # Save button
+        save_button = ttk.Button(
+            button_frame, 
+            text="Save Settings",
+            command=self.save_settings
+        )
+        save_button.pack(side=tk.RIGHT, padx=5)
+        
+        # Reset button
+        reset_button = ttk.Button(
+            button_frame, 
+            text="Reset to Defaults",
+            command=self.reset_settings
+        )
+        reset_button.pack(side=tk.RIGHT, padx=5)
+        
+        # Load current settings
+        self.load_settings()
+    
+    def save_settings(self):
+        """Save current settings to a configuration file"""
+        try:
+            settings = {
+                'theme': self.theme_var.get(),
+                'autostart': self.autostart_var.get(),
+                'dns_resolve': self.dns_resolve_var.get(),
+                'geo_enabled': self.geo_var.get(),
+                'interval': self.interval_var.get(),
+                'filter_local': self.filter_local_var.get(),
+                'debug': self.debug_var.get()
+            }
+            
+            # Create directory if it doesn't exist
+            os.makedirs(os.path.dirname(self.config_file), exist_ok=True)
+            
+            with open(self.config_file, 'w') as f:
+                json.dump(settings, f, indent=4)
+            
+            # Apply any immediate settings
+            self.apply_theme(settings['theme'])
+            
+            # Update application behavior based on settings
+            self.update_interval = int(settings['interval']) * 1000  # Convert to milliseconds
+            self.debug_mode = settings['debug']
+            
+            messagebox.showinfo("Settings Saved", "Your settings have been saved successfully.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
+
+    def load_settings(self):
+        """Load settings from the configuration file"""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    settings = json.load(f)
+                
+                # Apply loaded settings to UI
+                if 'theme' in settings:
+                    self.theme_var.set(settings['theme'])
+                    self.apply_theme(settings['theme'])
+                
+                if 'autostart' in settings:
+                    self.autostart_var.set(settings['autostart'])
+                
+                if 'dns_resolve' in settings:
+                    self.dns_resolve_var.set(settings['dns_resolve'])
+                
+                if 'geo_enabled' in settings:
+                    self.geo_var.set(settings['geo_enabled'])
+                
+                if 'interval' in settings:
+                    self.interval_var.set(settings['interval'])
+                    self.update_interval = int(settings['interval']) * 1000
+                
+                if 'filter_local' in settings:
+                    self.filter_local_var.set(settings['filter_local'])
+                
+                if 'debug' in settings:
+                    self.debug_var.set(settings['debug'])
+                    self.debug_mode = settings['debug']
+                
+                # If autostart is enabled, begin monitoring automatically
+                if settings.get('autostart', False):
+                    self.root.after(1000, self.start_capture)
+        except Exception as e:
+            # If there's an error loading settings, use defaults
+            print(f"Error loading settings: {str(e)}")
+            self.reset_settings()
+
+    def apply_theme(self, theme_name):
+        """Apply the selected theme to the application"""
+        try:
+            if theme_name == "system":
+                # Use system default theme
+                if self.style.theme_use() != "vista" and "vista" in self.style.theme_names():
+                    self.style.theme_use("vista")
+                elif "clam" in self.style.theme_names():
+                    self.style.theme_use("clam")
+            elif theme_name == "light":
+                # Light theme configuration
+                if "clam" in self.style.theme_names():
+                    self.style.theme_use("clam")
+                # Configure colors for light theme
+                self.style.configure(".", background="#f0f0f0", foreground="#000000")
+                self.style.configure("Treeview", background="#ffffff", fieldbackground="#ffffff")
+                self.style.map("Treeview", background=[("selected", "#0078d7")])
+            elif theme_name == "dark":
+                # Dark theme configuration
+                if "clam" in self.style.theme_names():
+                    self.style.theme_use("clam")
+                # Configure colors for dark theme
+                self.style.configure(".", background="#2d2d2d", foreground="#ffffff")
+                self.style.configure("Treeview", background="#3d3d3d", fieldbackground="#3d3d3d", foreground="#ffffff")
+                self.style.map("Treeview", background=[("selected", "#0078d7")])
+                self.style.configure("TNotebook", background="#2d2d2d")
+                self.style.configure("TNotebook.Tab", background="#3d3d3d", foreground="#ffffff")
+                self.style.map("TNotebook.Tab", background=[("selected", "#1e1e1e")], foreground=[("selected", "#ffffff")])
+                self.style.configure("TFrame", background="#2d2d2d")
+                self.style.configure("TLabel", background="#2d2d2d", foreground="#ffffff")
+                self.style.configure("TButton", background="#3d3d3d", foreground="#ffffff")
+        except Exception as e:
+            print(f"Error applying theme: {str(e)}")
+
+    def reset_settings(self):
+        """Reset settings to default values"""
+        try:
+            # Reset UI variables
+            self.theme_var.set("system")
+            self.autostart_var.set(False)
+            self.dns_resolve_var.set(True)
+            self.geo_var.set(False)
+            self.interval_var.set("3")
+            self.filter_local_var.set(True)
+            self.debug_var.set(False)
+            
+            # Apply default theme
+            self.apply_theme("system")
+            
+            # Reset application settings
+            self.update_interval = 3000  # 3 seconds in milliseconds
+            self.debug_mode = False
+            
+            # Notify user
+            messagebox.showinfo("Settings Reset", "Settings have been reset to default values.")
+            
+            # Save the reset settings to config file
+            self.save_settings()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to reset settings: {str(e)}")
+
+    def start_monitoring(self):
+        """Start network monitoring"""
+        try:
+            # Check if already running
+            if self.monitor and self.running:
+                messagebox.showinfo("Already Running", "Network monitoring is already active.")
+                return
+            
+            # Update status
+            self.status_var.set("Status: Starting Monitoring...")
+            
+            # Create SystemNetworkMonitor instance
+            if not self.monitor:
+                from .network_monitor import SystemNetworkMonitor
+            self.monitor = SystemNetworkMonitor()
+            
+            # Start capture
+            if self.monitor.start_capture():
+                self.running = True
+                self.status_var.set("Status: Monitoring Active")
+                
+                # Update button states
+                self.start_button.config(state=tk.DISABLED)
+                self.stop_button.config(state=tk.NORMAL)
+                
+                # Start data collection thread
+                if not self.monitor_thread or not self.monitor_thread.is_alive():
+                    self.monitor_thread = threading.Thread(target=self.collect_data)
+                self.monitor_thread.daemon = True
+                self.monitor_thread.start()
+                
+                # Start queue processing
+                self.process_queue()
+                
+                # Initialize map data update
+                if hasattr(self, 'map_animation') and self.map_animation is None:
+                    try:
+                        # For Plotly maps, we'll just update the country statistics table periodically
+                        self.map_animation = animation.FuncAnimation(
+                            plt.Figure(),  # Dummy figure, not actually used
+                            self.update_map, 
+                            interval=5000,
+                            cache_frame_data=False
+                        )
+                    except Exception as e:
+                        print(f"Error initializing map animation: {e}")
+                        self.map_animation = None
+                
+                # Update the animation in the overview tab
+                if not hasattr(self, 'traffic_animation') or self.traffic_animation is None:
+                    try:
+                        # Create animation for traffic graph
+                        self.traffic_animation = animation.FuncAnimation(
+                            self.traffic_canvas.figure, 
+                            self.update_graphs, 
+                            interval=1000,
+                            cache_frame_data=False
+                        )
+                    except Exception as e:
+                        print(f"Error initializing traffic animation: {e}")
+                        self.traffic_animation = None
+            else:
+                self.status_var.set("Status: Failed to Start Monitoring")
+                messagebox.showerror("Error", 
+                                  "Failed to start network monitoring. Check log for details.\n" +
+                                  "You may need administrator privileges.")
+        except Exception as e:
+            self.status_var.set(f"Status: Error - {str(e)}")
+            messagebox.showerror("Error", f"Failed to start monitoring: {str(e)}")
+            print(f"Error starting monitoring: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def stop_monitoring(self):
+        """Stop network monitoring"""
+        if self.running:
+            # Stop monitor
+            if self.monitor:
+                try:
+                    self.monitor.stop_capture()
+                except Exception as e:
+                    print(f"Error stopping monitor: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            # Update UI
+            self.running = False
+            self.start_button.configure(state=tk.NORMAL)
+            self.stop_button.configure(state=tk.DISABLED)
+            self.status_var.set("Status: Stopped")
+            
+            # Stop any running animations
+            try:
+                if hasattr(self, 'traffic_anim') and self.traffic_anim:
+                    self.traffic_anim.event_source.stop()
+            except Exception as e:
+                print(f"Error stopping traffic animation: {e}")
+            
+            # Stop overview animation
+            try:
+                if hasattr(self, 'overview_animation') and self.overview_animation:
+                    self.overview_animation.event_source.stop()
+                    self.overview_animation = None
+            except Exception as e:
+                print(f"Error stopping overview animation: {e}")
+                
+            # Stop map animation    
+            try:
+                if hasattr(self, 'map_animation') and self.map_animation:
+                    self.map_animation.event_source.stop()
+                    self.map_animation = None
+            except Exception as e:
+                print(f"Error stopping map animation: {e}")
+    
+    def collect_data(self):
+        """Background thread to collect data from the monitor and update the UI"""
+        try:
+            prev_time = time.time()
+            prev_packets = 0
+            prev_bytes = 0
+            
+            while self.running and self.monitor:
+                try:
+                    # Get stats from monitor
+                    stats = self.monitor.stats
+                    
+                    # Calculate rates
+                    now = time.time()
+                    elapsed = now - prev_time
+                    if elapsed > 0:
+                        packet_rate = (stats['total_packets'] - prev_packets) / elapsed
+                        byte_rate = (stats['total_bytes'] - prev_bytes) / elapsed
+                    else:
+                        packet_rate = 0
+                        byte_rate = 0
+                    
+                    # Update previous values
+                    prev_time = now
+                    prev_packets = stats['total_packets']
+                    prev_bytes = stats['total_bytes']
+                    
+                    # Update time series data
+                    current_time = datetime.datetime.now().strftime('%H:%M:%S')
+                    self.time_data.append(current_time)
+                    self.packets_data.append(packet_rate)
+                    self.bytes_data.append(byte_rate * 8 / 1000000)  # Convert to Mbps
+                
+                # Update protocol data
+                    self.protocol_data = stats['protocols'].copy()
+                    
+                    # Put data in queue for main thread to process
+                    data = {
+                    'total_packets': stats['total_packets'],
+                    'total_bytes': stats['total_bytes'],
+                    'packet_rate': packet_rate,
+                    'byte_rate': byte_rate,
+                        'protocols': stats['protocols'].copy(),
+                        'connections': stats['connections'].copy() if 'connections' in stats else {},
+                        'ports': stats['ports'].copy(),
+                        'sessions': stats['sessions'].copy(),
+                        'applications': stats['applications'].copy(),
+                        'domains': stats['domains'].copy(),
+                        'countries': stats['countries'].copy(),
+                        'geo_connections': stats['geo_connections'].copy() if 'geo_connections' in stats else []
+                    }
+                    
+                    self.queue.put(data)
+                
+                # Process queue on main thread
+                    self.root.after(100, self.process_queue)
+                    
+                    time.sleep(1)
+                
+                except Exception as e:
+                    print(f"Error updating data: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    time.sleep(1)
+                        
+        except Exception as e:
+            print(f"Error in data collection thread: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def process_queue(self):
+        """Process data queue on main thread"""
+        try:
+            # Limit the number of queue items processed at once to avoid UI freezing
+            items_processed = 0
+            max_items_per_cycle = 5  # Process at most 5 items per cycle
+            
+            while not self.queue.empty() and items_processed < max_items_per_cycle:
+                data = self.queue.get(block=False)
+                items_processed += 1
+                
+                try:
+                    # Update statistics labels - these are lightweight and can be updated frequently
+                    self.total_packets_var.set(f"Total Packets: {data.get('total_packets', 0)}")
+                    self.total_traffic_var.set(f"Total Traffic: {data.get('total_bytes', 0)/1024/1024:.2f} MB")
+                    self.packet_rate_var.set(f"Packet Rate: {data.get('packet_rate', 0):.2f} pps")
+                    self.bandwidth_var.set(f"Bandwidth: {data.get('byte_rate', 0)*8/1024/1024:.2f} Mbps")
+                    
+                    # Process protocol data safely
+                    protocols = data.get('protocols', {})
+                    # Store data for later use by tab-specific updates
+                    self.current_data = data
+                    
+                    # Update session data for connections tab - only if visible
+                    current_tab = self.notebook.select()
+                    tab_name = self.notebook.tab(current_tab, "text")
+                    
+                    # Each update method now checks if its own tab is visible
+                    if items_processed == max_items_per_cycle or self.queue.empty():
+                        # Only update tables on the last cycle or if queue is empty
+                        self.update_connections_table(data.get('connections', {}), data.get('sessions', {}))
+                        self.update_ports_table(data.get('ports', {}))
+                        self.update_applications_table(data.get('applications', {}), data.get('domains', {}))
+                
+                # Store geo data for map updates
+                        self.geo_data = {
+                                'countries': data.get('countries', {}),
+                                'connections': data.get('geo_connections', [])
+                            }
+                except Exception as e:
+                    print(f"Error processing data item in queue: {e}")
+            
+            # If we still have items in the queue, schedule another process cycle sooner
+            if not self.queue.empty():
+                self.root.after(50, self.process_queue)
+            else:
+                # Schedule the next queue check farther in the future
+                self.root.after(200, self.process_queue)
+                
+        except queue.Empty:
+            # Queue is empty, schedule the next check
+            self.root.after(200, self.process_queue)
+        except Exception as e:
+            print(f"Error processing queue: {e}")
+            # Schedule the next check even if there was an error
+            self.root.after(200, self.process_queue)
+
+    def setup_ports_tab(self):
+        """Set up the ports tab with port usage statistics"""
+        # Create main frame
+        ports_frame = ttk.Frame(self.ports_tab)
+        ports_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create treeview for displaying port data
+        columns = ("Port", "Service", "Packets", "Applications")
+        self.ports_tree = ttk.Treeview(ports_frame, columns=columns, show='headings')
+        
+        # Configure columns
+        for col in columns:
+            self.ports_tree.heading(col, text=col, command=lambda c=col: self.sort_treeview(self.ports_tree, c, False))
+        
+        # Set column widths
+        self.ports_tree.column("Port", width=80)
+        self.ports_tree.column("Service", width=150)
+        self.ports_tree.column("Packets", width=80)
+        self.ports_tree.column("Applications", width=350)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(ports_frame, orient=tk.VERTICAL, command=self.ports_tree.yview)
+        self.ports_tree.configure(yscroll=scrollbar.set)
+        
+        # Pack widgets
+        self.ports_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def record_traffic(self):
+        """Record network traffic to a file"""
+        try:
+            # Check if monitoring is active
+            if not self.running or not self.monitor:
+                messagebox.showwarning("Not Monitoring", 
+                                    "Please start monitoring before attempting to record traffic.")
+                return
+            
+            # Get file path for saving the recording
+            from tkinter import filedialog
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".pcap",
+                filetypes=[("Packet Capture", "*.pcap"), ("All Files", "*.*")],
+                title="Save Traffic Recording As"
+            )
+            
+            if not filename:  # User cancelled
+                return
+                
+            # Start recording traffic
+            self.status_var.set("Status: Recording traffic...")
+            messagebox.showinfo("Recording Started", 
+                             f"Traffic recording has started and will be saved to:\n{filename}\n\n"
+                             "Click OK to stop recording.")
+            
+            # Use the monitor to save packets to the specified file
+            if hasattr(self.monitor, 'export_packets'):
+                packets_saved = self.monitor.export_packets(filename)
+                messagebox.showinfo("Recording Complete", 
+                                 f"Traffic recording complete. {packets_saved} packets were saved to:\n{filename}")
+                self.status_var.set("Status: Monitoring Active")
+            else:
+                messagebox.showerror("Recording Failed", 
+                                  "This version of the network monitor does not support traffic recording.")
+                
+        except Exception as e:
+            messagebox.showerror("Recording Error", f"Failed to record traffic: {str(e)}")
+            self.status_var.set("Status: Monitoring Active")
+            
+    def block_connection(self):
+        """Block a network connection"""
+        try:
+            # Check if monitoring is active
+            if not self.running or not self.monitor:
+                messagebox.showwarning("Not Monitoring", 
+                                    "Please start monitoring before attempting to block connections.")
+                return
+            
+            # Create a new dialog window
+            block_dialog = tk.Toplevel(self.root)
+            block_dialog.title("Block Connection")
+            block_dialog.geometry("500x400")
+            block_dialog.transient(self.root)
+            block_dialog.grab_set()
+            
+            # Create frame for the connection list
+            list_frame = ttk.Frame(block_dialog)
+            list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            
+            # Create a treeview to display connections
+            columns = ("Source", "Destination", "Protocol", "Process")
+            conn_tree = ttk.Treeview(list_frame, columns=columns, show='headings')
+            
+            # Configure columns
+            for col in columns:
+                conn_tree.heading(col, text=col)
+                conn_tree.column(col, width=100)
+            
+            # Add scrollbar
+            scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=conn_tree.yview)
+            conn_tree.configure(yscroll=scrollbar.set)
+            
+            # Pack widgets
+            conn_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            # Add control buttons
+            btn_frame = ttk.Frame(block_dialog)
+            btn_frame.pack(fill=tk.X, padx=10, pady=10)
+            
+            # Function to populate the connection list
+            def populate_connections():
+                # Clear existing items
+                for item in conn_tree.get_children():
+                    conn_tree.delete(item)
+                
+                # Get active sessions from the monitor
+                sessions = self.monitor.stats.get('sessions', {})
+                
+                # Add connections to the list
+                for key, session in sessions.items():
+                    src = f"{session.get('src_ip', 'Unknown')}:{session.get('src_port', 0)}"
+                    dst = f"{session.get('dst_ip', 'Unknown')}:{session.get('dst_port', 0)}"
+                    protocol = session.get('protocol', 'Unknown')
+                    process = session.get('process', 'Unknown')
+                    
+                    conn_tree.insert('', tk.END, values=(src, dst, protocol, process), tags=(key,))
+            
+            # Function to block selected connection
+            def block_selected():
+                selected = conn_tree.selection()
+                if not selected:
+                    messagebox.showwarning("No Selection", "Please select a connection to block.")
+                    return
+                
+                # Get the connection key from the tags
+                item = selected[0]
+                key = conn_tree.item(item, "tags")[0]
+                
+                if key in self.monitor.stats.get('sessions', {}):
+                    session = self.monitor.stats['sessions'][key]
+                    
+                    if messagebox.askyesno("Confirm Block", 
+                                        f"Are you sure you want to block the connection from {session.get('src_ip')}:{session.get('src_port')} "
+                                        f"to {session.get('dst_ip')}:{session.get('dst_port')} "
+                                        f"({session.get('protocol')})?\n\n"
+                                        f"Process: {session.get('process', 'Unknown')}"):
+                        
+                        # Call the blocking function in the monitor
+                        if hasattr(self.monitor, 'block_connection'):
+                            success = self.monitor.block_connection(
+                                session.get('src_ip'), 
+                                session.get('src_port'),
+                                session.get('dst_ip'),
+                                session.get('dst_port'),
+                                session.get('protocol')
+                            )
+                            
+                            if success:
+                                messagebox.showinfo("Success", "Connection blocked successfully.")
+                                populate_connections()  # Refresh the list
+                            else:
+                                messagebox.showerror("Error", "Failed to block the connection.")
+                        else:
+                            messagebox.showerror("Not Supported", 
+                                             "This version of the network monitor does not support connection blocking.")
+            
+            # Add buttons
+            refresh_btn = ttk.Button(btn_frame, text="Refresh List", command=populate_connections)
+            refresh_btn.pack(side=tk.LEFT, padx=5)
+            
+            block_btn = ttk.Button(btn_frame, text="Block Selected", command=block_selected)
+            block_btn.pack(side=tk.LEFT, padx=5)
+            
+            close_btn = ttk.Button(btn_frame, text="Close", command=block_dialog.destroy)
+            close_btn.pack(side=tk.RIGHT, padx=5)
+            
+            # Initial population of the list
+            populate_connections()
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to open connection blocking tool: {str(e)}")
+    
+    def clear_stats(self):
+        """Clear all statistics and reset charts"""
+        try:
+            if not self.running or not self.monitor:
+                messagebox.showwarning("Not Monitoring", 
+                                    "Please start monitoring before clearing statistics.")
+                return
+            
+            if messagebox.askyesno("Confirm", "Are you sure you want to clear all statistics and charts?"):
+                # Reset data structures
+                self.time_data.clear()
+                self.packets_data.clear()
+                self.bytes_data.clear()
+                self.protocol_data.clear()
+                self.connection_data.clear()
+                self.port_data.clear()
+                self.application_data.clear()
+                self.domain_data.clear()
+                self.geo_data = {'connections': [], 'countries': {}}
+                
+                # Reset the monitor's statistics
+                if hasattr(self.monitor, 'reset_stats'):
+                    self.monitor.reset_stats()
+                
+                # Update displays
+                self.update_graphs(None)
+                self.update_connections_table({}, {})
+                self.update_ports_table({})
+                self.update_applications_table({}, {})
+                self.update_map(None)
+                
+                # Reset status display
+                self.total_packets_var.set("Total Packets: 0")
+                self.total_traffic_var.set("Total Traffic: 0 MB")
+                self.packet_rate_var.set("Packet Rate: 0 pps")
+                self.bandwidth_var.set("Bandwidth: 0 Mbps")
+                
+                messagebox.showinfo("Statistics Cleared", "All statistics and charts have been reset.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to clear statistics: {str(e)}")
+    
+    def show_about(self):
+        """Show the About dialog"""
+        about_dialog = tk.Toplevel(self.root)
+        about_dialog.title("About WinIDS Network Analyzer")
+        about_dialog.geometry("500x400")
+        about_dialog.transient(self.root)
+        about_dialog.grab_set()
+        
+        # Add logo or icon
+        # If you have a logo file, you can add it here
+        # logo = tk.PhotoImage(file="path/to/logo.png")
+        # logo_label = ttk.Label(about_dialog, image=logo)
+        # logo_label.image = logo  # Keep a reference
+        # logo_label.pack(pady=10)
+        
+        # App name
+        app_name = ttk.Label(about_dialog, text="WinIDS Network Analyzer", font=("Arial", 16, "bold"))
+        app_name.pack(pady=10)
+        
+        # Version info
+        version_info = ttk.Label(about_dialog, text="Version 1.0.0")
+        version_info.pack()
+        
+        # Description
+        description = ttk.Label(about_dialog, text="A comprehensive network traffic monitoring tool for Windows.")
+        description.pack(pady=5)
+        
+        # Features frame
+        features_frame = ttk.LabelFrame(about_dialog, text="Key Features")
+        features_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        features_text = (
+            "• Real-time network traffic monitoring\n"
+            "• Application and process identification\n"
+            "• Geolocation mapping of connections\n"
+            "• Port and protocol analysis\n"
+            "• Traffic recording and export\n"
+            "• Connection blocking capabilities\n"
+            "• Customizable user interface"
+        )
+        
+        features_label = ttk.Label(features_frame, text=features_text, justify=tk.LEFT)
+        features_label.pack(padx=10, pady=10, anchor=tk.W)
+        
+        # Credits
+        credits_label = ttk.Label(about_dialog, text="© 2023 WinIDS Project")
+        credits_label.pack(pady=5)
+        
+        # Close button
+        close_button = ttk.Button(about_dialog, text="Close", command=about_dialog.destroy)
+        close_button.pack(pady=10)
+
+def main():
+    try:
+        # Check if running as admin
+        try:
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            if not is_admin:
+                print("Warning: This application requires administrator privileges for full functionality.")
+                print("Some features may not work correctly.")
+        except Exception as e:
+            print(f"Error checking admin status: {e}")
+            
+        # Print information about the environment
+        print(f"Python version: {sys.version}")
+        print(f"Current directory: {os.getcwd()}")
+        print(f"Script location: {os.path.abspath(__file__)}")
+        
+        # Import check for required modules
+        required_modules = ["tkinter", "matplotlib", "psutil", "pydivert", "dns"]
+        for module in required_modules:
+            try:
+                __import__(module)
+                print(f"Successfully imported {module}")
+            except ImportError as e:
+                print(f"Error importing {module}: {e}")
+        
+        # Initialize and run the application
+        root = tk.Tk()
+        app = NetworkAnalyzerGUI(root)
+        
+        # Auto-start monitoring after a short delay
+        print("Auto-starting network monitoring in 2 seconds...")
+        root.after(2000, app.start_monitoring)  # Start monitoring after 2 seconds
+        
+        root.mainloop()
+    except Exception as e:
+        print(f"Error in main function: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Keep the console window open if error occurs
+        input("Press Enter to exit...")
+
+if __name__ == "__main__":
+    main() 

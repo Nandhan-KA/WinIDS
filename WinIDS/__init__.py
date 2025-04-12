@@ -5,7 +5,7 @@ A machine learning and reinforcement learning-based intrusion detection system
 designed for Windows environments with real-time monitoring capabilities.
 """
 
-__version__ = "0.1.1"
+__version__ = "1.2"
 __author__ = "Nandhan K"
 
 # Import main components

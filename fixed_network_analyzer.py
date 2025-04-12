@@ -1,0 +1,1 @@
+import sys; import site; from winids.netmon import network_analyzer_tkinter as nat; nat.NetworkAnalyzerGUI.overview_animation = None; nat.NetworkAnalyzerGUI.update_map.__defaults__ = (None,); sys.modules['winids.netmon.network_analyzer_tkinter'] = nat; exec('from winids.netmon.network_analyzer_tkinter import main; main()')

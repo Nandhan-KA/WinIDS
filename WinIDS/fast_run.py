@@ -182,7 +182,7 @@ class FastIDS:
             handshake = {
                 "type": "connect",
                 "client": "WinIDS-fast",
-                "version": "0.1.1",
+                "version": "1.2",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             }
             self.socket.send((json.dumps(handshake) + "\n").encode())

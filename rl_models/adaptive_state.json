@@ -1,0 +1,17 @@
+{
+  "threshold": 0.3899999999999998,
+  "base_threshold": 0.7,
+  "metrics": {
+    "total_packets": 0,
+    "alerts": 0,
+    "true_positives": 23,
+    "false_positives": 5,
+    "dos_alerts": 0,
+    "probe_alerts": 0,
+    "r2l_alerts": 0,
+    "u2r_alerts": 0,
+    "avg_confidence": 0.5,
+    "threshold": 0.3899999999999998
+  },
+  "timestamp": "2025-04-07T03:21:14.181028"
+}
